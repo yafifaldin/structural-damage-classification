@@ -17,6 +17,10 @@ The two *supervised* encoders (:class:`HierarchicalTargetEncoder` and
   values of new rows follow the same distribution as the out-of-fold values
   the model was trained on.
 
+:class:`HouseholdEncoder` and :class:`VulnerabilityTyper` use the same
+cross-fitting scheme. :class:`AdjacentAreaEncoder` needs no cross-fitting
+because it only reads labels of *other* areas, never the row's own area.
+
 This module only depends on numpy, pandas and scikit-learn.
 """
 import warnings
@@ -24,7 +28,12 @@ import warnings
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, OrdinalEncoder, StandardScaler
 
 # Prefix lengths of ``building_id`` that encode the (pre-2017) administrative
 # hierarchy: 2 = district, 4 = old VDC, 6 = old ward, longer = finer blocks.
@@ -49,8 +58,17 @@ VULNERABILITY_RANK = {
 STRUCTURAL_FEATURES = (
     ["bid"] + [f"id{k}" for k in ID_PREFIX_LENGTHS]
     + ["id_tail", "id_last", "h_per_floor", "period_T", "slender",
-       "total_area", "log_area", "age_x_floors", "vuln"]
+       "total_area", "log_area", "age_x_floors", "vuln", "age_bin", "hh", "is_secondary"]
 )
+# Helper keys created by StructuralFeatures that are only used as grouping keys
+# (not passed to the model directly, they duplicate information of other columns).
+HELPER_COLS = ("age_bin", "hh")
+AGE_BIN_EDGES = (5, 10, 15, 20, 30, 50, 100)
+
+# Construction columns used by the building-type models.
+CONSTRUCTION_CAT_COLS = ("superstructure", "foundation_type", "roof_type", "ground_floor_type",
+                         "other_floor_type")
+CONSTRUCTION_NUM_COLS = ("age_building", "count_floors_pre_eq", "plinth_area_sq_ft", "height_ft_pre_eq")
 
 # Location hierarchies for the target encoder: (column, smoothing strength m).
 DEFAULT_CHAINS = (
@@ -67,6 +85,23 @@ DEFAULT_COMBOS = (
     (("id6", "count_floors_pre_eq"), "id6", 20),
     (("id4", "superstructure", "count_floors_pre_eq"), "id4", 20),
     (("id6", "ground_floor_type"), "id6", 20),
+)
+# Iteration 3 (from EDA section F): construction features still informative after location.
+EXTRA_COMBOS = (
+    (("id6", "other_floor_type"), "id6", 20),
+    (("id6", "age_bin"), "id6", 20),
+    (("id9", "superstructure"), "id9", 10),
+)
+# Location x building type (clustering experiments).
+KMEANS_COMBOS = (
+    (("id4", "btype"), "id4", 30),
+    (("id6", "btype"), "id6", 20),
+    (("id9", "btype"), "id9", 10),
+)
+VULN_COMBOS = (
+    (("id4", "vtype"), "id4", 30),
+    (("id6", "vtype"), "id6", 20),
+    (("id9", "vtype"), "id9", 10),
 )
 
 
@@ -156,6 +191,13 @@ class StructuralFeatures(TransformerMixin, BaseEstimator):
         Size and ageing proxies.
     vuln
         Vulnerability rank of the superstructure material (EMS-98 inspired).
+    age_bin
+        Age group (edges 5, 10, 15, 20, 30, 50, 100 years), used as grouping key.
+    hh
+        Household number (``building_id // 10``); the last digit numbers the
+        buildings inside a household (EDA section E).
+    is_secondary
+        1 when the building is not the first one of its household.
 
     Parameters
     ----------
@@ -218,6 +260,10 @@ class StructuralFeatures(TransformerMixin, BaseEstimator):
         X["log_area"] = np.log1p(X["plinth_area_sq_ft"])
         X["age_x_floors"] = X["age_building"] * floors
         X["vuln"] = X[self.material_col].map(VULNERABILITY_RANK).fillna(2).astype(float)
+        X["age_bin"] = np.searchsorted(np.asarray(AGE_BIN_EDGES), X["age_building"].to_numpy(), side="right")
+        # last digit = building number inside a household; the first 11 digits identify the household
+        X["hh"] = ids // 10
+        X["is_secondary"] = (X["id_last"] > 1).astype(np.int64)
         return X[list(self.feature_names_out_)]
 
     def get_feature_names_out(self, input_features=None):
@@ -547,17 +593,28 @@ class HierarchicalTargetEncoder(TransformerMixin, BaseEstimator):
 # 4. ID-neighbour label features
 # --------------------------------------------------------------------------
 class IdNeighborEncoder(TransformerMixin, BaseEstimator):
-    """Label statistics of the buildings with the closest ``building_id``.
+    """Label statistics of the buildings with the closest survey number.
 
     Survey IDs are assigned sequentially inside an (old) ward, so buildings
     with close IDs tend to be physically close and to have suffered similar
-    ground shaking. For each row this encoder finds the ``k`` labelled
-    buildings in the same ``group_col`` with the smallest
-    ``|id - id_neighbour|`` and returns, for every ``k`` in ``ks``: the
-    number of neighbours found, their mean grade, their class shares and the
-    log mean ID distance. It also returns a distance-weighted mean grade of
-    the ``weighted_k`` nearest neighbours and the log distance to the
-    nearest one.
+    ground shaking.
+
+    Iteration 3 (EDA section E): the last digit of ``building_id`` numbers
+    the buildings inside a household and households are numbered in steps of
+    10. Buildings of the *same* household are *less* similar than random
+    buildings of the ward, while adjacent households are the most similar.
+    Therefore distances are measured on the household number
+    (``id // household_div``) and, with ``exclude_household=True``, buildings
+    of the query's own household are skipped (they get their own features in
+    :class:`HouseholdEncoder`).
+
+    For every ``k`` in ``ks`` the encoder returns: number of neighbours
+    found, their mean grade, their class shares and the log mean distance.
+    It also returns a distance-weighted mean grade of the ``weighted_k``
+    nearest neighbours and the log distance to the nearest one.
+
+    ``household_div=1, exclude_household=False, ks=(3, 10, 30)`` reproduces
+    the iteration-2 behaviour.
 
     Uses cross-fitting, see the module docstring.
 
@@ -567,13 +624,17 @@ class IdNeighborEncoder(TransformerMixin, BaseEstimator):
         Integer building ID column.
     group_col : str, default="id6"
         Neighbours must share this area code.
-    ks : tuple of int, default=(3, 10, 30)
+    ks : tuple of int, default=(1, 2, 5, 10, 30)
         Neighbourhood sizes.
-    window : int, default=30
+    window : int, default=40
         Candidates searched on each side of the sorted position
-        (``max(ks)`` must be <= ``2 * window``).
+        (``max(ks)`` and ``weighted_k`` must be <= ``2 * window``).
     weighted_k : int, default=10
         Neighbourhood size for the distance-weighted mean.
+    household_div : int, default=10
+        Distances are computed on ``id // household_div``.
+    exclude_household : bool, default=True
+        Skip neighbours with the same ``id // household_div`` as the query.
     n_splits : int, default=5
         Number of cross-fitting folds.
     random_state : int, default=42
@@ -582,14 +643,17 @@ class IdNeighborEncoder(TransformerMixin, BaseEstimator):
         Rows processed at once (limits memory use).
     """
 
-    def __init__(self, id_col="bid", group_col="id6", ks=(3, 10, 30), window=30, weighted_k=10,
-                 n_splits=5, random_state=42, chunk_size=100_000):
+    def __init__(self, id_col="bid", group_col="id6", ks=(1, 2, 5, 10, 30), window=40, weighted_k=10,
+                 household_div=10, exclude_household=True, n_splits=5, random_state=42,
+                 chunk_size=100_000):
         """Store parameters (scikit-learn convention: no logic here)."""
         self.id_col = id_col
         self.group_col = group_col
         self.ks = ks
         self.window = window
         self.weighted_k = weighted_k
+        self.household_div = household_div
+        self.exclude_household = exclude_household
         self.n_splits = n_splits
         self.random_state = random_state
         self.chunk_size = chunk_size
@@ -617,14 +681,19 @@ class IdNeighborEncoder(TransformerMixin, BaseEstimator):
     def _encode_chunk(self, ids, groups, store):
         """Compute neighbour features for one chunk of query rows."""
         kb, kg, ky = store
-        n_known, n_cls, w = len(kb), self.n_classes_, self.window
+        n_known, n_cls, w, div = len(kb), self.n_classes_, self.window, self.household_div
         pos = np.searchsorted(kb, ids)
         cand = pos[:, None] + np.arange(-w, w)[None, :]
         valid = (cand >= 0) & (cand < n_known)
         cc = np.clip(cand, 0, n_known - 1)
-        dist = np.abs(kb[cc] - ids[:, None]).astype(np.float64)
-        dist[~valid | (kg[cc] != groups[:, None])] = np.inf
-        order = np.argsort(dist, axis=1)
+        q_serial = ids // div
+        c_serial = kb[cc] // div
+        dist = np.abs(c_serial - q_serial[:, None]).astype(np.float64)
+        bad = ~valid | (kg[cc] != groups[:, None])
+        if self.exclude_household:
+            bad |= c_serial == q_serial[:, None]
+        dist[bad] = np.inf
+        order = np.argsort(dist, axis=1, kind="stable")
         cand_y = ky[cc]
         cols = []
         for k in self.ks:
@@ -725,16 +794,492 @@ class IdNeighborEncoder(TransformerMixin, BaseEstimator):
         pandas.DataFrame
         """
         ids, groups = self._arrays(X)
-        total = np.zeros((len(X), len(self.feature_names_out_)))
-        count = np.zeros_like(total)
-        for store in self.stores_:
-            enc = self._encode(ids, groups, store)
-            fin = np.isfinite(enc)
-            total += np.where(fin, enc, 0.0)
-            count += fin
-        with np.errstate(invalid="ignore", divide="ignore"):
-            out = np.where(count > 0, total / np.maximum(count, 1), np.nan)
+        out = nan_average([self._encode(ids, groups, store) for store in self.stores_])
         return pd.DataFrame(out.astype(np.float32), index=X.index, columns=self.feature_names_out_)
+
+    def get_feature_names_out(self, input_features=None):
+        """Return the output column names.
+
+        Parameters
+        ----------
+        input_features : ignored
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
+        return self.feature_names_out_
+
+
+def nan_average(arrays):
+    """Element-wise mean of equally shaped arrays, ignoring NaN.
+
+    Parameters
+    ----------
+    arrays : list of numpy.ndarray
+
+    Returns
+    -------
+    numpy.ndarray
+        NaN where every input is NaN.
+    """
+    total = np.zeros_like(arrays[0], dtype=np.float64)
+    count = np.zeros_like(total)
+    for a in arrays:
+        fin = np.isfinite(a)
+        total += np.where(fin, a, 0.0)
+        count += fin
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+
+# --------------------------------------------------------------------------
+# 5. household (same first 11 digits) label features
+# --------------------------------------------------------------------------
+class HouseholdEncoder(TransformerMixin, BaseEstimator):
+    """Grades of the *other* labelled buildings of the same household.
+
+    EDA section E: about 8.6 % of the buildings share their household
+    (``building_id // 10``) with another building. Buildings of one household
+    are not simply similar (secondary buildings are on average 0.22 grade
+    lighter than their neighbours), so the raw statistics are given to the
+    model and the trees decide how to use them.
+
+    Output: ``sib_n`` (number of labelled siblings), ``sib_mean``,
+    ``sib_min`` and ``sib_max`` (NaN when there is no sibling).
+
+    Uses cross-fitting, see the module docstring.
+
+    Parameters
+    ----------
+    hh_col : str, default="hh"
+        Household key column.
+    n_splits : int, default=5
+        Number of cross-fitting folds.
+    random_state : int, default=42
+        Seed of the fold split.
+    """
+
+    def __init__(self, hh_col="hh", n_splits=5, random_state=42):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.hh_col = hh_col
+        self.n_splits = n_splits
+        self.random_state = random_state
+
+    def _fit_table(self, keys, grades):
+        """Aggregate count / mean / min / max grade per household."""
+        return pd.DataFrame({"g": grades}, index=pd.Index(keys)).groupby(level=0)["g"].agg(
+            ["size", "mean", "min", "max"])
+
+    def _encode(self, keys, table):
+        """Look up the household statistics of ``keys``."""
+        tab = table.reindex(pd.Index(keys))
+        n = tab["size"].fillna(0).to_numpy(dtype=float)
+        return np.column_stack([n, tab["mean"].to_numpy(dtype=float),
+                                tab["min"].to_numpy(dtype=float), tab["max"].to_numpy(dtype=float)])
+
+    def _cross_fit(self, X, y):
+        """Build one household table per fold; return the fold indices."""
+        self.classes_, y_idx = encode_labels(y)
+        grades = (y_idx + 1).astype(float)
+        keys = X[self.hh_col].to_numpy(dtype=np.int64)
+        skf = StratifiedKFold(self.n_splits, shuffle=True, random_state=self.random_state)
+        folds = list(skf.split(np.zeros(len(y_idx)), y_idx))
+        self.tables_ = [self._fit_table(keys[tr], grades[tr]) for tr, _ in folds]
+        self.feature_names_out_ = np.asarray(["sib_n", "sib_mean", "sib_min", "sib_max"], dtype=object)
+        return folds, keys
+
+    def fit(self, X, y):
+        """Fit the fold-specific household tables.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Must contain ``hh_col``.
+        y : array-like of shape (n_rows,)
+
+        Returns
+        -------
+        self
+        """
+        self._cross_fit(X, y)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Fit and return the **out-of-fold** household features.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : array-like of shape (n_rows,)
+        **fit_params : ignored
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        folds, keys = self._cross_fit(X, y)
+        out = np.empty((len(X), 4), dtype=np.float32)
+        for (_, va), table in zip(folds, self.tables_):
+            out[va] = self._encode(keys[va], table)
+        return pd.DataFrame(out, index=X.index, columns=self.feature_names_out_)
+
+    def transform(self, X):
+        """Household features of new rows, averaged over the fold tables.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        keys = X[self.hh_col].to_numpy(dtype=np.int64)
+        out = nan_average([self._encode(keys, t) for t in self.tables_])
+        return pd.DataFrame(out.astype(np.float32), index=X.index, columns=self.feature_names_out_)
+
+    def get_feature_names_out(self, input_features=None):
+        """Return the output column names.
+
+        Parameters
+        ----------
+        input_features : ignored
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
+        return self.feature_names_out_
+
+
+# --------------------------------------------------------------------------
+# 6. neighbouring area codes
+# --------------------------------------------------------------------------
+class AdjacentAreaEncoder(TransformerMixin, BaseEstimator):
+    """Damage distribution of the previous and next area code inside the same parent area.
+
+    EDA section E: consecutive ward codes (``id6``) inside one VDC have more
+    similar mean damage than random wards of that VDC, i.e. the codes are
+    roughly ordered geographically. For every level the encoder pools the
+    labels of the neighbouring codes (the closest smaller and larger code
+    sharing the same parent ``code // parent_div``) and returns the smoothed
+    class shares, the expected grade and the number of pooled rows.
+
+    No cross-fitting is needed: a row's own area is never part of the pool,
+    so its own label is never used.
+
+    Parameters
+    ----------
+    levels : tuple of (str, int), default=(("id6", 100), ("id9", 1000))
+        ``(column, parent_div)``; the parent of a code is ``code // parent_div``.
+    m : float, default=20
+        Smoothing strength towards the global class distribution.
+    """
+
+    def __init__(self, levels=(("id6", 100), ("id9", 1000)), m=20):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.levels = levels
+        self.m = m
+
+    def fit(self, X, y):
+        """Store the per-code class counts of every level.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Must contain the level columns.
+        y : array-like of shape (n_rows,)
+
+        Returns
+        -------
+        self
+        """
+        self.classes_, y_idx = encode_labels(y)
+        k = len(self.classes_)
+        Y = np.eye(k)[y_idx]
+        self.global_ = Y.mean(axis=0)
+        self.codes_, self.sums_, self.counts_ = {}, {}, {}
+        for col, _ in self.levels:
+            tab = group_sum(np.column_stack([Y, np.ones(len(Y))]), make_key(X, [col])).sort_index()
+            self.codes_[col] = tab.index.to_numpy(dtype=np.int64)
+            self.sums_[col] = tab.iloc[:, :k].to_numpy(dtype=float)
+            self.counts_[col] = tab.iloc[:, k].to_numpy(dtype=float)
+        names = []
+        for col, _ in self.levels:
+            names += [f"adj_{col}_mean"] + [f"adj_{col}_p{j + 1}" for j in range(k)] + [f"adj_{col}_n"]
+        self.feature_names_out_ = np.asarray(names, dtype=object)
+        return self
+
+    def transform(self, X):
+        """Encode the neighbouring codes of every row.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        k = len(self.classes_)
+        grade = np.arange(1, k + 1, dtype=float)
+        blocks = []
+        for col, div in self.levels:
+            codes, sums, counts = self.codes_[col], self.sums_[col], self.counts_[col]
+            q = X[col].to_numpy(dtype=np.int64)
+            left = np.searchsorted(codes, q, side="left") - 1
+            right = np.searchsorted(codes, q, side="right")
+            ok_l = (left >= 0) & (codes[np.clip(left, 0, len(codes) - 1)] // div == q // div)
+            ok_r = (right < len(codes)) & (codes[np.clip(right, 0, len(codes) - 1)] // div == q // div)
+            li, ri = np.clip(left, 0, len(codes) - 1), np.clip(right, 0, len(codes) - 1)
+            s = sums[li] * ok_l[:, None] + sums[ri] * ok_r[:, None]
+            n = counts[li] * ok_l + counts[ri] * ok_r
+            enc = (s + self.m * self.global_) / (n[:, None] + self.m)
+            blocks += [(enc @ grade)[:, None], enc, n[:, None]]
+        out = np.hstack(blocks).astype(np.float32)
+        return pd.DataFrame(out, index=X.index, columns=self.feature_names_out_)
+
+    def get_feature_names_out(self, input_features=None):
+        """Return the output column names.
+
+        Parameters
+        ----------
+        input_features : ignored
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
+        return self.feature_names_out_
+
+
+# --------------------------------------------------------------------------
+# 7. building types by clustering (experiments)
+# --------------------------------------------------------------------------
+class BuildingTypeClusterer(TransformerMixin, BaseEstimator):
+    """Unsupervised building archetypes with K-Means (adds column ``btype``).
+
+    Construction categories are one-hot encoded, numeric columns are
+    ``log1p``-transformed and standardised, then ``MiniBatchKMeans`` groups
+    the buildings into ``n_clusters`` types. The type is used as a key for
+    location x building-type target encoding (``KMEANS_COMBOS``), which
+    compresses six construction columns into one key with large enough
+    groups.
+
+    Pipeline step placed *before* the ``ColumnTransformer``; returns the
+    input frame with ``btype`` appended.
+
+    Parameters
+    ----------
+    n_clusters : int, default=16
+    cat_cols : tuple of str
+        Construction categories.
+    num_cols : tuple of str
+        Construction numeric columns.
+    random_state : int, default=42
+    """
+
+    def __init__(self, n_clusters=16, cat_cols=CONSTRUCTION_CAT_COLS, num_cols=CONSTRUCTION_NUM_COLS,
+                 random_state=42):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.n_clusters = n_clusters
+        self.cat_cols = cat_cols
+        self.num_cols = num_cols
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        """Fit the encoding + K-Means pipeline.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : ignored
+
+        Returns
+        -------
+        self
+        """
+        prep = ColumnTransformer([
+            ("cat", OneHotEncoder(handle_unknown="ignore"), list(self.cat_cols)),
+            ("num", Pipeline([("log", FunctionTransformer(np.log1p)), ("scale", StandardScaler())]),
+             list(self.num_cols)),
+        ])
+        self.model_ = Pipeline([
+            ("prep", prep),
+            ("kmeans", MiniBatchKMeans(n_clusters=self.n_clusters, random_state=self.random_state,
+                                       n_init=3, batch_size=4096)),
+        ]).fit(X[list(self.cat_cols) + list(self.num_cols)])
+        self.feature_names_out_ = np.asarray(list(X.columns) + ["btype"], dtype=object)
+        return self
+
+    def transform(self, X):
+        """Append the cluster label ``btype``.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        X = X.copy()
+        X["btype"] = self.model_.predict(X[list(self.cat_cols) + list(self.num_cols)]).astype(np.int64)
+        return X
+
+    def get_feature_names_out(self, input_features=None):
+        """Return the output column names.
+
+        Parameters
+        ----------
+        input_features : ignored
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
+        return self.feature_names_out_
+
+
+class VulnerabilityTyper(TransformerMixin, BaseEstimator):
+    """Supervised building types from a construction-only vulnerability score.
+
+    A small gradient-boosting regressor learns, from construction features
+    only, how much worse/better a building does than the other buildings of
+    its area (target = grade - leave-one-out mean grade of ``location_col``).
+    The prediction ``vscore`` is a location-free vulnerability score; its
+    quantile bin ``vtype`` (``n_bins`` types) is used as a key for location x
+    building-type target encoding (``VULN_COMBOS``).
+
+    Uses cross-fitting: in ``fit_transform`` every row is scored by a model
+    trained on the other folds (residuals computed inside the training folds
+    only); ``transform`` averages the fold models.
+
+    Pipeline step placed *before* the ``ColumnTransformer``; returns the
+    input frame with ``vscore`` and ``vtype`` appended.
+
+    Parameters
+    ----------
+    cat_cols : tuple of str
+        Categorical construction columns (ordinal-encoded, native categorical splits).
+    num_cols : tuple of str
+        Numeric construction columns.
+    location_col : str, default="id6"
+        Area used for the leave-one-out mean.
+    n_bins : int, default=12
+    max_iter : int, default=150
+        Boosting iterations of each fold model.
+    n_splits : int, default=5
+    random_state : int, default=42
+    """
+
+    def __init__(self, cat_cols=CONSTRUCTION_CAT_COLS + ("position", "plan_configuration",
+                                                         "land_surface_condition"),
+                 num_cols=CONSTRUCTION_NUM_COLS + ("h_per_floor", "slender", "id_last"),
+                 location_col="id6", n_bins=12, max_iter=150, n_splits=5, random_state=42):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.cat_cols = cat_cols
+        self.num_cols = num_cols
+        self.location_col = location_col
+        self.n_bins = n_bins
+        self.max_iter = max_iter
+        self.n_splits = n_splits
+        self.random_state = random_state
+
+    def _new_model(self):
+        """Create an unfitted encoder + regressor pipeline."""
+        n_cat = len(self.cat_cols)
+        prep = ColumnTransformer([
+            ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), list(self.cat_cols)),
+            ("num", "passthrough", list(self.num_cols)),
+        ])
+        reg = HistGradientBoostingRegressor(max_iter=self.max_iter, learning_rate=0.1, max_leaf_nodes=31,
+                                            min_samples_leaf=200, categorical_features=list(range(n_cat)),
+                                            random_state=self.random_state)
+        return Pipeline([("prep", prep), ("reg", reg)])
+
+    @staticmethod
+    def _loo_residual(keys, grades):
+        """Grade minus the leave-one-out mean grade of the row's area."""
+        s = pd.Series(grades).groupby(keys).transform("sum").to_numpy()
+        n = pd.Series(grades).groupby(keys).transform("size").to_numpy()
+        loo = np.where(n > 1, (s - grades) / np.maximum(n - 1, 1), grades.mean())
+        return grades - loo
+
+    def _cols(self):
+        """All input columns of the regressor."""
+        return list(self.cat_cols) + list(self.num_cols)
+
+    def _cross_fit(self, X, y):
+        """Train one model per fold; return the out-of-fold scores."""
+        self.classes_, y_idx = encode_labels(y)
+        grades = (y_idx + 1).astype(float)
+        keys = X[self.location_col].to_numpy()
+        Xc = X[self._cols()]
+        skf = StratifiedKFold(self.n_splits, shuffle=True, random_state=self.random_state)
+        scores = np.empty(len(X))
+        self.models_ = []
+        for tr, va in skf.split(np.zeros(len(y_idx)), y_idx):
+            resid = self._loo_residual(keys[tr], grades[tr])
+            model = self._new_model().fit(Xc.iloc[tr], resid)
+            scores[va] = model.predict(Xc.iloc[va])
+            self.models_.append(model)
+        self.edges_ = np.unique(np.quantile(scores, np.linspace(0, 1, self.n_bins + 1)[1:-1]))
+        self.feature_names_out_ = np.asarray(list(X.columns) + ["vscore", "vtype"], dtype=object)
+        return scores
+
+    def _append(self, X, scores):
+        """Return ``X`` with ``vscore`` and ``vtype`` columns."""
+        X = X.copy()
+        X["vscore"] = scores.astype(np.float32)
+        X["vtype"] = np.searchsorted(self.edges_, scores, side="right").astype(np.int64)
+        return X
+
+    def fit(self, X, y):
+        """Fit the fold models and the bin edges.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : array-like of shape (n_rows,)
+
+        Returns
+        -------
+        self
+        """
+        self._cross_fit(X, y)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Fit and append the **out-of-fold** vulnerability score and type.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : array-like of shape (n_rows,)
+        **fit_params : ignored
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        return self._append(X, self._cross_fit(X, y))
+
+    def transform(self, X):
+        """Append the vulnerability score (mean of fold models) and type of new rows.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        Xc = X[self._cols()]
+        scores = np.mean([m.predict(Xc) for m in self.models_], axis=0)
+        return self._append(X, scores)
 
     def get_feature_names_out(self, input_features=None):
         """Return the output column names.

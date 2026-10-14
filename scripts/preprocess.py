@@ -13,10 +13,18 @@ from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
 
 from .feature_engineering import (
+    DEFAULT_CHAINS,
+    DEFAULT_COMBOS,
+    EXTRA_COMBOS,
+    HELPER_COLS,
+    KMEANS_COMBOS,
+    STRUCTURAL_FEATURES,
+    VULN_COMBOS,
+    AdjacentAreaEncoder,
     GroupRelativeFeatures,
     HierarchicalTargetEncoder,
+    HouseholdEncoder,
     IdNeighborEncoder,
-    STRUCTURAL_FEATURES,
 )
 
 COMPETITION = "structural-damage-classification"
@@ -30,13 +38,82 @@ CAT_COLS = ["land_surface_condition", "foundation_type", "roof_type", "ground_fl
             "other_floor_type", "position", "plan_configuration", "superstructure"]
 
 # Column groups fed to each branch of the ColumnTransformer.
-PASSTHROUGH_COLS = NUM_COLS + LOC_COLS + STRUCTURAL_FEATURES
+PASSTHROUGH_COLS = NUM_COLS + LOC_COLS + [c for c in STRUCTURAL_FEATURES if c not in HELPER_COLS]
 GROUP_INPUT_COLS = ["id6", "id9", "ward_id", "age_building", "height_ft_pre_eq",
                     "count_floors_pre_eq", "plinth_area_sq_ft", "vuln", "superstructure"]
-TE_INPUT_COLS = ["id2", "id4", "id6", "id8", "id9", "id10", "district_id", "vdcmun_id", "ward_id",
-                 "superstructure", "foundation_type", "roof_type", "count_floors_pre_eq",
-                 "ground_floor_type"]
 NEIGHBOR_INPUT_COLS = ["bid", "id6"]
+
+# --------------------------------------------------------------------------
+# feature configuration (iteration 3 ablation)
+# --------------------------------------------------------------------------
+#: Feature set of iteration 2 (starting point of the ablation).
+BASELINE_CONFIG = dict(neighbor="v1", household=False, adjacent=False, extra_combos=False,
+                       kmeans=False, vuln=False)
+#: Default when no ablation is run: evidence-based EDA changes on, clustering off.
+DEFAULT_CONFIG = dict(neighbor="v2", household=True, adjacent=True, extra_combos=True,
+                      kmeans=False, vuln=False)
+NEIGHBOR_PARAMS = {
+    "v1": dict(ks=(3, 10, 30), window=30, household_div=1, exclude_household=False),
+    "v2": dict(ks=(1, 2, 5, 10, 30), window=40, household_div=10, exclude_household=True),
+}
+
+
+def resolve_config(config=None):
+    """Complete a (partial) feature configuration with :data:`DEFAULT_CONFIG`.
+
+    Parameters
+    ----------
+    config : dict, optional
+        Keys: ``neighbor`` ("v1"/"v2"), ``household``, ``adjacent``,
+        ``extra_combos``, ``kmeans``, ``vuln`` (bool).
+
+    Returns
+    -------
+    dict
+    """
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    unknown = set(cfg) - set(DEFAULT_CONFIG)
+    if unknown:
+        raise ValueError(f"unknown config keys: {sorted(unknown)}")
+    return cfg
+
+
+def combos_for(config):
+    """Location x attribute combinations used by the target encoder for a config.
+
+    Parameters
+    ----------
+    config : dict
+        Resolved configuration.
+
+    Returns
+    -------
+    tuple
+    """
+    combos = list(DEFAULT_COMBOS)
+    if config["extra_combos"]:
+        combos += list(EXTRA_COMBOS)
+    if config["kmeans"]:
+        combos += list(KMEANS_COMBOS)
+    if config["vuln"]:
+        combos += list(VULN_COMBOS)
+    return tuple(combos)
+
+
+def te_input_cols(combos):
+    """Unique columns needed by the target encoder (chains + combos), in order.
+
+    Parameters
+    ----------
+    combos : tuple
+
+    Returns
+    -------
+    list of str
+    """
+    cols = [col for chain in DEFAULT_CHAINS for col, _ in chain]
+    cols += [c for combo_cols, _, _ in combos for c in combo_cols]
+    return list(dict.fromkeys(cols))
 
 
 # --------------------------------------------------------------------------
@@ -207,24 +284,31 @@ class CategoricalCoder(TransformerMixin, BaseEstimator):
         return self.feature_names_out_
 
 
-def build_preprocessor(n_splits=5, random_state=42):
+def build_preprocessor(config=None, n_splits=5, random_state=42):
     """Build the ``ColumnTransformer`` that turns raw + structural columns into model features.
 
-    Branches
-    --------
+    Branches (``config`` switches the optional ones)
+    ------------------------------------------------
     num : passthrough
-        Raw numeric, location and structural-proxy columns.
+        Raw numeric, location and structural-proxy columns (+ ``btype``,
+        ``vscore``, ``vtype`` when the clustering steps are enabled).
     cat : :class:`CategoricalCoder`
         Construction categories as pandas ``category``.
     grp : :class:`~scripts.feature_engineering.GroupRelativeFeatures`
         Building compared with its area (unsupervised).
     te : :class:`~scripts.feature_engineering.HierarchicalTargetEncoder`
-        Out-of-fold location / location x construction target encoding.
+        Out-of-fold location / location x attribute target encoding.
     nb : :class:`~scripts.feature_engineering.IdNeighborEncoder`
-        Out-of-fold labels of the nearest building IDs.
+        Out-of-fold labels of the nearest survey numbers (``v1`` or ``v2``).
+    hh : :class:`~scripts.feature_engineering.HouseholdEncoder` (optional)
+        Out-of-fold grades of the other buildings of the household.
+    adj : :class:`~scripts.feature_engineering.AdjacentAreaEncoder` (optional)
+        Damage of the neighbouring ward / block codes.
 
     Parameters
     ----------
+    config : dict, optional
+        Feature configuration, see :func:`resolve_config`.
     n_splits : int, default=5
         Cross-fitting folds of the supervised encoders.
     random_state : int, default=42
@@ -235,16 +319,29 @@ def build_preprocessor(n_splits=5, random_state=42):
     sklearn.compose.ColumnTransformer
         Configured to output a pandas DataFrame.
     """
+    cfg = resolve_config(config)
+    combos = combos_for(cfg)
+    passthrough = list(PASSTHROUGH_COLS)
+    if cfg["kmeans"]:
+        passthrough.append("btype")
+    if cfg["vuln"]:
+        passthrough += ["vscore", "vtype"]
+    transformers = [
+        ("num", "passthrough", passthrough),
+        ("cat", CategoricalCoder(), CAT_COLS),
+        ("grp", GroupRelativeFeatures(), GROUP_INPUT_COLS),
+        ("te", HierarchicalTargetEncoder(combos=combos, n_splits=n_splits, random_state=random_state),
+         te_input_cols(combos)),
+        ("nb", IdNeighborEncoder(n_splits=n_splits, random_state=random_state,
+                                 **NEIGHBOR_PARAMS[cfg["neighbor"]]),
+         NEIGHBOR_INPUT_COLS),
+    ]
+    if cfg["household"]:
+        transformers.append(("hh", HouseholdEncoder(n_splits=n_splits, random_state=random_state), ["hh"]))
+    if cfg["adjacent"]:
+        transformers.append(("adj", AdjacentAreaEncoder(), ["id6", "id9"]))
     preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", "passthrough", PASSTHROUGH_COLS),
-            ("cat", CategoricalCoder(), CAT_COLS),
-            ("grp", GroupRelativeFeatures(), GROUP_INPUT_COLS),
-            ("te", HierarchicalTargetEncoder(n_splits=n_splits, random_state=random_state),
-             TE_INPUT_COLS),
-            ("nb", IdNeighborEncoder(n_splits=n_splits, random_state=random_state),
-             NEIGHBOR_INPUT_COLS),
-        ],
+        transformers=transformers,
         remainder="drop",
         verbose_feature_names_out=False,
     )
