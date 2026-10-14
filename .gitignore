@@ -1,0 +1,19 @@
+# Data besar
+data/*.csv
+data/*.zip
+!data/.gitkeep
+
+# Cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+sdc_cache_*/
+
+# Environment
+venv/
+.venv/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
