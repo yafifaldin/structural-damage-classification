@@ -1293,3 +1293,263 @@ class VulnerabilityTyper(TransformerMixin, BaseEstimator):
         numpy.ndarray of str
         """
         return self.feature_names_out_
+
+
+# --------------------------------------------------------------------------
+# 8. two-stage residual intensity (iteration 4)
+# --------------------------------------------------------------------------
+#: Construction / building columns of the location-free models.
+LOCATION_FREE_CAT_COLS = CONSTRUCTION_CAT_COLS + ("position", "plan_configuration", "land_surface_condition")
+LOCATION_FREE_NUM_COLS = CONSTRUCTION_NUM_COLS + ("h_per_floor", "slender", "id_last")
+RESIDUAL_LEVELS = (("id4", 30), ("id6", 20), ("id9", 10), ("id10", 5))
+
+
+def construction_regressor(cat_cols, num_cols, max_iter=150, random_state=42):
+    """Location-free gradient-boosting regressor of the damage grade.
+
+    Parameters
+    ----------
+    cat_cols : sequence of str
+        Categorical columns (ordinal-encoded, native categorical splits).
+    num_cols : sequence of str
+        Numeric columns.
+    max_iter : int, default=150
+    random_state : int, default=42
+
+    Returns
+    -------
+    sklearn.pipeline.Pipeline
+        ``ColumnTransformer`` (``OrdinalEncoder`` + passthrough) followed by
+        ``HistGradientBoostingRegressor``.
+    """
+    prep = ColumnTransformer([
+        ("cat", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1), list(cat_cols)),
+        ("num", "passthrough", list(num_cols)),
+    ])
+    reg = HistGradientBoostingRegressor(max_iter=max_iter, learning_rate=0.1, max_leaf_nodes=31,
+                                        min_samples_leaf=200, categorical_features=list(range(len(cat_cols))),
+                                        random_state=random_state)
+    return Pipeline([("prep", prep), ("reg", reg)])
+
+
+def nearest_household_mean(q_ids, q_groups, store, ks, window=40, div=10, chunk_size=100_000):
+    """Mean value of the ``k`` nearest *other* households in the same group.
+
+    Parameters
+    ----------
+    q_ids, q_groups : numpy.ndarray of int64
+        Building ids and group codes of the query rows.
+    store : tuple of numpy.ndarray
+        ``(sorted_ids, groups, values)`` of the labelled rows, sorted by id.
+    ks : sequence of int
+        Neighbourhood sizes (each <= ``2 * window``).
+    window : int, default=40
+        Candidates searched on each side of the sorted position.
+    div : int, default=10
+        Household number = ``id // div``; the query's own household is skipped.
+    chunk_size : int, default=100_000
+
+    Returns
+    -------
+    numpy.ndarray of shape (n_query, len(ks))
+        NaN where no neighbour was found.
+    """
+    kb, kg, kv = store
+    out = np.full((len(q_ids), len(ks)), np.nan)
+    if len(kb) == 0:
+        return out
+    if max(ks) > 2 * window:
+        raise ValueError("max(ks) must be <= 2 * window")
+    offsets = np.arange(-window, window)[None, :]
+    for s in range(0, len(q_ids), chunk_size):
+        ids, groups = q_ids[s:s + chunk_size], q_groups[s:s + chunk_size]
+        cand = np.searchsorted(kb, ids)[:, None] + offsets
+        valid = (cand >= 0) & (cand < len(kb))
+        cc = np.clip(cand, 0, len(kb) - 1)
+        q_serial, c_serial = ids // div, kb[cc] // div
+        dist = np.abs(c_serial - q_serial[:, None]).astype(np.float64)
+        dist[~valid | (kg[cc] != groups[:, None]) | (c_serial == q_serial[:, None])] = np.inf
+        order = np.argsort(dist, axis=1, kind="stable")
+        vals = kv[cc]
+        for j, k in enumerate(ks):
+            sel = order[:, :k]
+            ok = np.isfinite(np.take_along_axis(dist, sel, axis=1))
+            v = np.take_along_axis(vals, sel, axis=1)
+            cnt = ok.sum(axis=1)
+            out[s:s + chunk_size, j] = np.where(cnt > 0, np.where(ok, v, 0.0).sum(axis=1) / np.maximum(cnt, 1),
+                                                np.nan)
+    return out
+
+
+class ResidualIntensityEncoder(TransformerMixin, BaseEstimator):
+    """Local shaking intensity *net of the construction mix* (two-stage residual encoding).
+
+    A plain target encoding of an area mixes two things: how strong the
+    shaking was there, and how many vulnerable buildings stand there (an
+    area full of mud-stone houses looks "intense" even under moderate
+    shaking). This encoder separates them:
+
+    1. Stage 1 - a location-free regressor predicts the grade from
+       construction features only (``ri_cons`` = expected grade of this
+       building type anywhere in the data).
+    2. Stage 2 - for the labelled rows the residual ``grade - prediction``
+       is computed and averaged per area level (``id4 -> id6 -> id9 -> id10``,
+       each level shrunk towards its parent) and over the nearest other
+       households in the same ward. A positive value means buildings there
+       were damaged more than their construction alone explains, i.e.
+       stronger local shaking.
+
+    Output: ``ri_cons``, ``ri_<level>`` / ``ri_<level>_n`` for every level,
+    ``ri_expected`` (= ``ri_cons`` + finest residual) and ``ri_nb<k>``.
+
+    Uses cross-fitting, see the module docstring: every fold trains its own
+    stage-1 model and residual tables on the other folds.
+
+    Parameters
+    ----------
+    cat_cols, num_cols : tuple of str
+        Location-free features of the stage-1 regressor.
+    levels : tuple of (str, float)
+        ``(area column, smoothing m)`` from coarse to fine.
+    id_col : str, default="bid"
+    group_col : str, default="id6"
+        Neighbours must share this area.
+    ks : tuple of int, default=(5, 20)
+        Neighbourhood sizes (households).
+    window : int, default=40
+    max_iter : int, default=150
+        Boosting iterations of the stage-1 regressor.
+    n_splits : int, default=5
+    random_state : int, default=42
+    """
+
+    def __init__(self, cat_cols=LOCATION_FREE_CAT_COLS, num_cols=LOCATION_FREE_NUM_COLS,
+                 levels=RESIDUAL_LEVELS, id_col="bid", group_col="id6", ks=(5, 20), window=40,
+                 max_iter=150, n_splits=5, random_state=42):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.cat_cols = cat_cols
+        self.num_cols = num_cols
+        self.levels = levels
+        self.id_col = id_col
+        self.group_col = group_col
+        self.ks = ks
+        self.window = window
+        self.max_iter = max_iter
+        self.n_splits = n_splits
+        self.random_state = random_state
+
+    def _model_cols(self):
+        """Input columns of the stage-1 regressor."""
+        return list(self.cat_cols) + list(self.num_cols)
+
+    def _build_names(self):
+        """Output feature names in the same order as :meth:`_encode`."""
+        names = ["ri_cons"]
+        for col, _ in self.levels:
+            names += [f"ri_{col}", f"ri_{col}_n"]
+        return names + ["ri_expected"] + [f"ri_nb{k}" for k in self.ks]
+
+    def _fit_fold(self, X, grades):
+        """Stage-1 model, residual tables and neighbour store from labelled rows."""
+        model = construction_regressor(self.cat_cols, self.num_cols, self.max_iter,
+                                       self.random_state).fit(X[self._model_cols()], grades)
+        resid = grades - model.predict(X[self._model_cols()])
+        vals = np.column_stack([resid, np.ones(len(resid))])
+        tables = {col: group_sum(vals, make_key(X, [col])) for col, _ in self.levels}
+        ids = X[self.id_col].to_numpy(dtype=np.int64)
+        order = np.argsort(ids, kind="stable")
+        store = (ids[order], X[self.group_col].to_numpy(dtype=np.int64)[order], resid[order])
+        return {"model": model, "tables": tables, "store": store}
+
+    def _encode(self, X, fold):
+        """Encode query rows with one fold's model, tables and store."""
+        cons = fold["model"].predict(X[self._model_cols()])
+        blocks = [cons]
+        prior = np.zeros(len(X))
+        for col, m in self.levels:
+            tab = np.nan_to_num(fold["tables"][col].reindex(make_key(X, [col])).to_numpy(dtype=float), nan=0.0)
+            s, n = tab[:, 0], tab[:, 1]
+            enc = (s + m * prior) / (n + m)
+            blocks += [enc, n]
+            prior = enc
+        blocks.append(cons + prior)
+        nb = nearest_household_mean(X[self.id_col].to_numpy(dtype=np.int64),
+                                    X[self.group_col].to_numpy(dtype=np.int64),
+                                    fold["store"], self.ks, self.window)
+        return np.column_stack(blocks + [nb])
+
+    def _cross_fit(self, X, y):
+        """Fit one stage-1 model + tables per fold; return the fold indices."""
+        self.classes_, y_idx = encode_labels(y)
+        grades = (y_idx + 1).astype(float)
+        skf = StratifiedKFold(self.n_splits, shuffle=True, random_state=self.random_state)
+        folds = list(skf.split(np.zeros(len(y_idx)), y_idx))
+        self.folds_ = [self._fit_fold(X.iloc[tr], grades[tr]) for tr, _ in folds]
+        self.feature_names_out_ = np.asarray(self._build_names(), dtype=object)
+        return folds
+
+    def fit(self, X, y):
+        """Fit the fold-specific stage-1 models and residual tables.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Must contain the model columns, the level columns, ``id_col`` and ``group_col``.
+        y : array-like of shape (n_rows,)
+
+        Returns
+        -------
+        self
+        """
+        self._cross_fit(X, y)
+        return self
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Fit and return the **out-of-fold** residual-intensity features.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : array-like of shape (n_rows,)
+        **fit_params : ignored
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        folds = self._cross_fit(X, y)
+        out = np.empty((len(X), len(self.feature_names_out_)), dtype=np.float32)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            for (_, va), fold in zip(folds, self.folds_):
+                out[va] = self._encode(X.iloc[va], fold)
+        return pd.DataFrame(out, index=X.index, columns=self.feature_names_out_)
+
+    def transform(self, X):
+        """Residual-intensity features of new rows, averaged over the fold encoders.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        pandas.DataFrame
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            out = nan_average([self._encode(X, fold) for fold in self.folds_])
+        return pd.DataFrame(out.astype(np.float32), index=X.index, columns=self.feature_names_out_)
+
+    def get_feature_names_out(self, input_features=None):
+        """Return the output column names.
+
+        Parameters
+        ----------
+        input_features : ignored
+
+        Returns
+        -------
+        numpy.ndarray of str
+        """
+        return self.feature_names_out_

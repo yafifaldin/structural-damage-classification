@@ -18,6 +18,9 @@ from .feature_engineering import (
     EXTRA_COMBOS,
     HELPER_COLS,
     KMEANS_COMBOS,
+    LOCATION_FREE_CAT_COLS,
+    LOCATION_FREE_NUM_COLS,
+    RESIDUAL_LEVELS,
     STRUCTURAL_FEATURES,
     VULN_COMBOS,
     AdjacentAreaEncoder,
@@ -25,6 +28,7 @@ from .feature_engineering import (
     HierarchicalTargetEncoder,
     HouseholdEncoder,
     IdNeighborEncoder,
+    ResidualIntensityEncoder,
 )
 
 COMPETITION = "structural-damage-classification"
@@ -48,10 +52,12 @@ NEIGHBOR_INPUT_COLS = ["bid", "id6"]
 # --------------------------------------------------------------------------
 #: Feature set of iteration 2 (starting point of the ablation).
 BASELINE_CONFIG = dict(neighbor="v1", household=False, adjacent=False, extra_combos=False,
-                       kmeans=False, vuln=False)
-#: Default when no ablation is run: evidence-based EDA changes on, clustering off.
+                       residual=False, kmeans=False, vuln=False)
+#: Default when no ablation is run: EDA-based changes + residual intensity on, clustering off.
 DEFAULT_CONFIG = dict(neighbor="v2", household=True, adjacent=True, extra_combos=True,
-                      kmeans=False, vuln=False)
+                      residual=True, kmeans=False, vuln=False)
+RESIDUAL_INPUT_COLS = list(dict.fromkeys(
+    list(LOCATION_FREE_CAT_COLS) + list(LOCATION_FREE_NUM_COLS) + [c for c, _ in RESIDUAL_LEVELS] + ["bid", "id6"]))
 NEIGHBOR_PARAMS = {
     "v1": dict(ks=(3, 10, 30), window=30, household_div=1, exclude_household=False),
     "v2": dict(ks=(1, 2, 5, 10, 30), window=40, household_div=10, exclude_household=True),
@@ -65,7 +71,7 @@ def resolve_config(config=None):
     ----------
     config : dict, optional
         Keys: ``neighbor`` ("v1"/"v2"), ``household``, ``adjacent``,
-        ``extra_combos``, ``kmeans``, ``vuln`` (bool).
+        ``extra_combos``, ``residual``, ``kmeans``, ``vuln`` (bool).
 
     Returns
     -------
@@ -164,15 +170,16 @@ def find_data_dir(data_dir=None):
 def output_dir():
     """Return the root folder for outputs and create its sub-folders.
 
-    Uses the repository root when it is writable, otherwise
-    ``/kaggle/working``. Creates ``models/``, ``submissions/`` and
-    ``reports/figures/``.
+    On Kaggle always ``/kaggle/working`` (outside the cloned repository, so
+    re-cloning the repo never deletes results); locally the repository root.
+    Creates ``models/``, ``submissions/`` and ``reports/figures/``.
 
     Returns
     -------
     pathlib.Path
     """
-    base = ROOT if os.access(ROOT, os.W_OK) else Path("/kaggle/working")
+    kaggle = Path("/kaggle/working")
+    base = kaggle if kaggle.exists() else ROOT
     for sub in ("models", "submissions", "reports/figures"):
         (base / sub).mkdir(parents=True, exist_ok=True)
     return base
@@ -304,6 +311,8 @@ def build_preprocessor(config=None, n_splits=5, random_state=42):
         Out-of-fold grades of the other buildings of the household.
     adj : :class:`~scripts.feature_engineering.AdjacentAreaEncoder` (optional)
         Damage of the neighbouring ward / block codes.
+    ri : :class:`~scripts.feature_engineering.ResidualIntensityEncoder` (optional)
+        Out-of-fold shaking intensity net of the construction mix (two-stage).
 
     Parameters
     ----------
@@ -340,6 +349,9 @@ def build_preprocessor(config=None, n_splits=5, random_state=42):
         transformers.append(("hh", HouseholdEncoder(n_splits=n_splits, random_state=random_state), ["hh"]))
     if cfg["adjacent"]:
         transformers.append(("adj", AdjacentAreaEncoder(), ["id6", "id9"]))
+    if cfg["residual"]:
+        transformers.append(("ri", ResidualIntensityEncoder(n_splits=n_splits, random_state=random_state),
+                             RESIDUAL_INPUT_COLS))
     preprocessor = ColumnTransformer(
         transformers=transformers,
         remainder="drop",

@@ -9,7 +9,7 @@ Tugas 1 *Supervised Machine Learning* — kompetisi Kaggle
 |---|---|
 | **Tipe masalah** | Klasifikasi multikelas (5 kelas, tidak seimbang) |
 | **Metrik** | Macro F1-Score |
-| **Model** | `Pipeline` scikit-learn: feature engineering custom + `ColumnTransformer` + LightGBM |
+| **Model** | `Pipeline` scikit-learn: feature engineering custom + `ColumnTransformer`, blend LightGBM + XGBoost |
 | **Validasi** | Stratified 5-fold CV, seluruh pipeline di-fit ulang tiap fold |
 | **CV macro F1** | lihat [Hasil](#hasil) |
 
@@ -37,7 +37,7 @@ structural-damage-classification/
 │   ├── train.py                # pipeline, ablation, tuning, CV, bobot kelas, training final
 │   └── predict.py              # load model & tulis submission
 ├── models/
-│   └── pipeline_model_lgbm.pkl
+│   └── pipeline_model.pkl
 ├── submissions/
 │   └── submission.csv
 └── reports/
@@ -88,10 +88,11 @@ Lewat notebook (berurutan): `01_eda.ipynb` → `02_modeling.ipynb` → `03_submi
 Lewat command line:
 
 ```bash
-python -m scripts.train --ablation          # pilih fitur (ablation) + CV + model final
-python -m scripts.train --ablation --tune   # + RandomizedSearchCV
-python -m scripts.train                     # konfigurasi default tanpa ablation
-python -m scripts.predict                   # -> submissions/submission.csv
+python -m scripts.train --smoke             # cek cepat semua jalur kode (±5 menit)
+python -m scripts.train --ablation          # ablation fitur + CV LightGBM & XGBoost + blend + model final
+python -m scripts.train --models lgbm       # hanya LightGBM
+python -m scripts.train --ablation --tune   # + RandomizedSearchCV LightGBM
+python -m scripts.predict                   # -> submissions/submission.csv (label angka 1-5)
 ```
 
 ### Kaggle Notebook
@@ -103,13 +104,16 @@ python -m scripts.predict                   # -> submissions/submission.csv
    ```python
    !git clone --depth 1 https://github.com/yafifaldin/structural-damage-classification.git /kaggle/working/repo
    %cd /kaggle/working/repo
+   !python -m scripts.train --smoke
    !python -m scripts.train --ablation
    !python -m scripts.predict
    ```
 4. Output (model, gambar, submission) ditulis ke `/kaggle/working`; `submission.csv` juga disalin ke
    `/kaggle/working/submission.csv` agar bisa langsung di-submit.
 
-Estimasi waktu di CPU Kaggle: ablation ±30–40 menit, CV 5-fold ±40–50 menit, model final ±10 menit.
+Estimasi waktu di CPU Kaggle (iterasi 4): smoke test ±5 menit, ablation ±40 menit, CV LightGBM ±60 menit,
+CV XGBoost ±60 menit, model final ±25 menit. Jalankan lewat **Save Version → Save & Run All**.
+Di Kaggle semua output ditulis ke `/kaggle/working/` (di luar folder repo hasil clone).
 
 ---
 
@@ -129,11 +133,13 @@ Estimasi waktu di CPU Kaggle: ablation ±30–40 menit, CV 5-fold ±40–50 meni
    | `AdjacentAreaEncoder` | distribusi kerusakan ward/blok dengan kode sebelah | ya (area lain saja) |
    | `BuildingTypeClusterer` | tipe bangunan dari `MiniBatchKMeans` (one-hot + scaling dalam `Pipeline`) | tidak (eksperimen) |
    | `VulnerabilityTyper` | skor kerentanan dari model kecil berbasis fitur konstruksi saja, dibagi menjadi tipe | ya, out-of-fold (eksperimen) |
+   | `ResidualIntensityEncoder` | **dua tahap**: (1) model tanpa lokasi memprediksi grade dari konstruksi; (2) sisa grade − prediksi dirata-ratakan per wilayah (id4→id10) dan per rumah tangga tetangga = intensitas guncangan bersih dari pengaruh komposisi bangunan | ya, out-of-fold |
    | `CategoricalCoder` | kategori konstruksi → `pandas.Categorical` (split native LightGBM) | tidak |
 
 3. **Pipeline** (`scripts/train.py → build_pipeline`):
-   `StructuralFeatures → [BuildingTypeClusterer] → [VulnerabilityTyper] → ColumnTransformer(num | cat | grp | te | nb | hh | adj) → LGBMClassifier`.
-   Langkah dalam kurung siku diaktifkan oleh konfigurasi fitur.
+   `StructuralFeatures → [BuildingTypeClusterer] → [VulnerabilityTyper] → ColumnTransformer(num | cat | grp | te | nb | hh | adj | ri) → LGBMClassifier / XGBGradeClassifier`.
+   Langkah dalam kurung siku diaktifkan oleh konfigurasi fitur. Model final adalah `BlendClassifier`:
+   rata-rata tertimbang pipeline LightGBM dan XGBoost (bobot blend dipilih dari prediksi OOF) + bobot kelas.
 4. **Pencegahan kebocoran:** encoder berlabel memakai *cross-fitting* di `fit_transform`
    (setiap baris train di-encode dari fold lain). Data baru di-encode dengan rata-rata tabel per fold,
    sehingga distribusinya sama dengan nilai out-of-fold saat training. Karena seluruh pipeline di-fit ulang
@@ -147,8 +153,8 @@ Estimasi waktu di CPU Kaggle: ablation ±30–40 menit, CV 5-fold ±40–50 meni
 7. **Evaluasi & optimasi macro F1:** Stratified 5-fold OOF → probabilitas dikalikan bobot per kelas
    (coordinate search), diuji jujur dengan bobot dari 4 fold yang dievaluasi di fold ke-5. Bobot disimpan di
    dalam model (`WeightedArgmaxClassifier`). Prediksi OOF disimpan untuk analisis error.
-8. **Submission** (`03_submission.ipynb` / `scripts/predict.py`): format & urutan sama dengan
-   `sample_submission.csv`.
+8. **Submission** (`03_submission.ipynb` / `scripts/predict.py`): urutan baris sama dengan
+   `sample_submission.csv`, label ditulis sebagai **angka 1–5** (penilai Kaggle menolak label `"Grade X"`).
 
 ---
 
@@ -176,12 +182,20 @@ Estimasi waktu di CPU Kaggle: ablation ±30–40 menit, CV 5-fold ±40–50 meni
 | 1 | LightGBM, fitur mentah + ID lokasi kategorikal | 0,533 (argmax) |
 | 1 | + prefiks `building_id`, target encoding berjenjang, tetangga ID, fitur area, bobot kelas | 0,596 |
 | 2 | Refactor ke `Pipeline` + `ColumnTransformer` | _isi dari `cv_summary.json`_ |
-| 3 | Ablation fitur dari EDA + clustering | _isi dari `ablation_results.csv` & `cv_summary.json`_ |
+| 3 | Ablation fitur dari EDA + clustering (LightGBM) | _isi dari `ablation_results.csv`_ |
+| 3 | + blend XGBoost (dijalankan manual di notebook) | _isi_ |
+| 4 | + intensitas residual dua tahap, LightGBM lr 0,05, blend resmi | _isi dari `cv_summary.json`_ |
 
-| Leaderboard | Skor |
+| Submission | Public LB |
 |---|---|
-| Public | _isi_ |
+| Iterasi 1 (skrip awal) | 0,60365 |
+| Iterasi 3 (pipeline + ablation, LightGBM) | 0,60228 |
+| Iterasi 3 + blend XGBoost | 0,60324 |
+| Iterasi 4 | _isi_ |
 | Private | _diumumkan setelah kompetisi selesai_ |
+
+Selisih antar submission di atas (±0,001) lebih kecil dari variasi acak public LB (±0,002–0,003),
+dan CV (≈0,596) konsisten dengan LB (≈0,603) — validasi dapat dipercaya.
 
 ---
 

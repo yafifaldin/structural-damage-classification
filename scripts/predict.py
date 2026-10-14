@@ -2,7 +2,7 @@
 
 Command line::
 
-    python -m scripts.predict                      # uses models/pipeline_model_lgbm.pkl
+    python -m scripts.predict                      # uses models/pipeline_model.pkl
     python -m scripts.predict --model path/to.pkl --out submissions/submission.csv
 """
 import argparse
@@ -21,7 +21,7 @@ def find_model(path=None):
     """Locate the saved model file.
 
     Search order: ``path`` argument, ``<output>/models``, ``<repo>/models``
-    and any ``pipeline_model_lgbm.pkl`` under ``/kaggle/input`` (e.g. the
+    and any ``pipeline_model.pkl`` under ``/kaggle/input`` (e.g. the
     output of a previous Kaggle notebook added as input).
 
     Parameters
@@ -83,20 +83,23 @@ def predict_grades(model, test):
     return np.asarray(model.predict(test)).astype(int)
 
 
-def format_submission(sample, ids, grades):
-    """Build the submission in the exact format and row order of ``sample_submission.csv``.
+def format_submission(sample, ids, grades, text_labels=False):
+    """Build the submission with the columns and row order of ``sample_submission.csv``.
 
-    If the sample uses labels like ``"Grade 3"`` the same style is used,
-    otherwise plain integers.
+    The Kaggle scorer expects **integer** grades 1..5 (an upload with
+    ``"Grade 3"`` labels fails with "The input string 'Grade' was not in a
+    correct format"), even though ``sample_submission.csv`` shows text labels.
 
     Parameters
     ----------
     sample : pandas.DataFrame
-        ``sample_submission.csv``.
+        ``sample_submission.csv`` (only its ``building_id`` order is used).
     ids : array-like
         ``building_id`` of the predicted rows.
     grades : array-like of int
         Predicted grades 1..5.
+    text_labels : bool, default=False
+        Write ``"Grade X"`` instead of integers (not accepted by the scorer).
 
     Returns
     -------
@@ -111,7 +114,6 @@ def format_submission(sample, ids, grades):
     sub = sample[[ID_COL]].merge(pred, on=ID_COL, how="left")
     if sub["_grade"].isna().any():
         raise ValueError(f"{int(sub['_grade'].isna().sum())} building_id without prediction")
-    text_labels = str(sample[TARGET].iloc[0]).strip().lower().startswith("grade")
     grades_int = sub["_grade"].astype(int)
     sub[TARGET] = ("Grade " + grades_int.astype(str)) if text_labels else grades_int
     return sub[[ID_COL, TARGET]]

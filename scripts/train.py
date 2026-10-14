@@ -3,22 +3,24 @@
 Pipeline::
 
     StructuralFeatures -> [BuildingTypeClusterer] -> [VulnerabilityTyper]
-        -> ColumnTransformer (num | cat | grp | te | nb | [hh] | [adj]) -> LGBMClassifier
+        -> ColumnTransformer (num | cat | grp | te | nb | [hh] | [adj] | [ri])
+        -> LGBMClassifier  or  XGBGradeClassifier
 
 Optional steps/branches are switched by a feature configuration (see
 :func:`scripts.preprocess.resolve_config`). :func:`run_ablation` chooses the
 configuration greedily on a region subsample.
 
-The fitted pipeline is wrapped in :class:`WeightedArgmaxClassifier`, which
-multiplies the predicted class probabilities by per-class weights tuned to
-maximise **macro F1** (the competition metric).
+The final model is a :class:`BlendClassifier`: a weighted average of the
+LightGBM and XGBoost pipelines (blend weight chosen on out-of-fold
+predictions) followed by per-class weights tuned to maximise **macro F1**
+(the competition metric).
 
 Command line::
 
-    python -m scripts.train                       # CV + final model, default config & params
-    python -m scripts.train --ablation            # choose the feature config first
-    python -m scripts.train --ablation --tune     # + RandomizedSearchCV on the pipeline
-    python -m scripts.train --skip-cv             # final model only (weights = 1)
+    python -m scripts.train --smoke               # 2-minute end-to-end check on a tiny subsample
+    python -m scripts.train --ablation            # choose features, CV LightGBM + XGBoost, blend, fit
+    python -m scripts.train --models lgbm         # LightGBM only
+    python -m scripts.train --skip-cv             # final model only (no blend / class weights)
 """
 import argparse
 import json
@@ -40,14 +42,24 @@ from .feature_engineering import BuildingTypeClusterer, StructuralFeatures, Vuln
 from .preprocess import (BASELINE_CONFIG, ID_COL, build_preprocessor, load_data, output_dir,
                          resolve_config, split_xy)
 
-MODEL_NAME = "pipeline_model_lgbm.pkl"
+MODEL_NAME = "pipeline_model.pkl"
 SEED = 42
 
+#: Final LightGBM parameters (iteration 4: smaller learning rate, more trees).
 DEFAULT_LGBM_PARAMS = dict(
-    n_estimators=500, learning_rate=0.08, num_leaves=63, min_child_samples=60,
+    n_estimators=900, learning_rate=0.05, num_leaves=63, min_child_samples=60,
     colsample_bytree=0.4, subsample=0.8, subsample_freq=1, reg_lambda=5.0, max_bin=127,
     n_jobs=-1, random_state=7, verbose=-1,
 )
+#: Faster LightGBM used only to *compare* feature sets in the ablation.
+ABLATION_LGBM_PARAMS = dict(n_estimators=300, learning_rate=0.1)
+#: XGBoost parameters (labels are shifted to 0..K-1 inside XGBGradeClassifier).
+DEFAULT_XGB_PARAMS = dict(
+    n_estimators=600, learning_rate=0.07, max_depth=7, min_child_weight=5, subsample=0.8,
+    colsample_bytree=0.5, reg_lambda=5.0, max_bin=128, tree_method="hist", enable_categorical=True,
+    objective="multi:softprob", eval_metric="mlogloss", n_jobs=-1, random_state=7,
+)
+MODEL_TYPES = ("lgbm", "xgb")
 
 PARAM_DISTRIBUTIONS = {
     "clf__num_leaves": [31, 63, 127, 255],
@@ -67,6 +79,7 @@ ABLATION_STEPS = (
     ("household (bangunan serumah)", {"household": True}, 0.0),
     ("adjacent_area (ward/blok tetangga)", {"adjacent": True}, 0.0),
     ("extra_combos (lantai atas, umur, id9 x material)", {"extra_combos": True}, 0.0),
+    ("residual_intensity (intensitas bersih dua tahap)", {"residual": True}, 0.0),
     ("kmeans_btype (clustering KMeans)", {"kmeans": True}, 0.002),
     ("vuln_vtype (tipe kerentanan supervised)", {"vuln": True}, 0.002),
 )
@@ -75,13 +88,78 @@ ABLATION_STEPS = (
 # --------------------------------------------------------------------------
 # model objects
 # --------------------------------------------------------------------------
-def build_pipeline(params=None, config=None, memory=None, n_splits=5, random_state=SEED):
+class XGBGradeClassifier(ClassifierMixin, BaseEstimator):
+    """``xgboost.XGBClassifier`` that accepts arbitrary class labels (e.g. grades 1..5).
+
+    XGBoost requires labels ``0..K-1``; this wrapper encodes them in ``fit``
+    and exposes the original labels in ``classes_``.
+
+    Parameters
+    ----------
+    params : dict, optional
+        Overrides of :data:`DEFAULT_XGB_PARAMS`.
+    """
+
+    def __init__(self, params=None):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.params = params
+
+    def fit(self, X, y):
+        """Fit XGBoost on label-encoded targets.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+            Features (``category`` columns are handled natively).
+        y : array-like
+
+        Returns
+        -------
+        self
+        """
+        from xgboost import XGBClassifier  # imported lazily: optional dependency
+
+        y = np.asarray(y)
+        self.classes_ = np.unique(y)
+        self.model_ = XGBClassifier(**{**DEFAULT_XGB_PARAMS, **(self.params or {})})
+        self.model_.fit(X, np.searchsorted(self.classes_, y))
+        return self
+
+    def predict_proba(self, X):
+        """Class probabilities (columns ordered like ``classes_``).
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        numpy.ndarray
+        """
+        return self.model_.predict_proba(X)
+
+    def predict(self, X):
+        """Most probable class label.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        numpy.ndarray
+        """
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+def build_pipeline(params=None, config=None, memory=None, n_splits=5, random_state=SEED, model="lgbm"):
     """Create the full (unfitted) scikit-learn pipeline.
 
     Parameters
     ----------
     params : dict, optional
-        LightGBM parameters overriding :data:`DEFAULT_LGBM_PARAMS`.
+        Classifier parameters overriding :data:`DEFAULT_LGBM_PARAMS` (``model="lgbm"``)
+        or :data:`DEFAULT_XGB_PARAMS` (``model="xgb"``).
     config : dict, optional
         Feature configuration (see :func:`scripts.preprocess.resolve_config`).
     memory : str or joblib.Memory, optional
@@ -90,13 +168,20 @@ def build_pipeline(params=None, config=None, memory=None, n_splits=5, random_sta
         Cross-fitting folds of the supervised encoders.
     random_state : int, default=SEED
         Seed of the encoder folds.
+    model : {"lgbm", "xgb"}, default="lgbm"
+        Final classifier.
 
     Returns
     -------
     sklearn.pipeline.Pipeline
     """
     cfg = resolve_config(config)
-    lgbm_params = {**DEFAULT_LGBM_PARAMS, **(params or {})}
+    if model == "lgbm":
+        clf = LGBMClassifier(**{**DEFAULT_LGBM_PARAMS, **(params or {})})
+    elif model == "xgb":
+        clf = XGBGradeClassifier(params)
+    else:
+        raise ValueError(f"unknown model {model!r}; choose from {MODEL_TYPES}")
     steps = [("struct", StructuralFeatures())]
     if cfg["kmeans"]:
         steps.append(("btype", BuildingTypeClusterer(random_state=random_state)))
@@ -104,7 +189,7 @@ def build_pipeline(params=None, config=None, memory=None, n_splits=5, random_sta
         steps.append(("vtype", VulnerabilityTyper(n_splits=n_splits, random_state=random_state)))
     steps += [
         ("prep", build_preprocessor(cfg, n_splits=n_splits, random_state=random_state)),
-        ("clf", LGBMClassifier(**lgbm_params)),
+        ("clf", clf),
     ]
     return Pipeline(steps=steps, memory=memory)
 
@@ -156,6 +241,78 @@ class WeightedArgmaxClassifier(ClassifierMixin, BaseEstimator):
         numpy.ndarray of shape (n_rows, n_classes)
         """
         return self.estimator_.predict_proba(X)
+
+    def predict(self, X):
+        """Predict labels with the weighted argmax rule.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        numpy.ndarray
+        """
+        w = np.ones(len(self.classes_)) if self.class_weights is None else np.asarray(self.class_weights)
+        return self.classes_[np.argmax(self.predict_proba(X) * w, axis=1)]
+
+
+class BlendClassifier(ClassifierMixin, BaseEstimator):
+    """Weighted average of several probabilistic pipelines + per-class decision weights.
+
+    ``predict_proba = sum_i blend_weights[i] * estimators[i].predict_proba``
+    and ``predict = argmax(predict_proba * class_weights)``.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        Named unfitted pipelines (same classes, same label order).
+    blend_weights : array-like, optional
+        Weight of each estimator (default: equal weights; normalised to sum 1).
+    class_weights : array-like, optional
+        Per-class multipliers for the decision rule (``None`` = all ones).
+    """
+
+    def __init__(self, estimators=None, blend_weights=None, class_weights=None):
+        """Store parameters (scikit-learn convention: no logic here)."""
+        self.estimators = estimators
+        self.blend_weights = blend_weights
+        self.class_weights = class_weights
+
+    def fit(self, X, y):
+        """Fit a clone of every estimator on the same data.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+        y : array-like
+
+        Returns
+        -------
+        self
+        """
+        self.estimators_ = []
+        for name, est in self.estimators:
+            t0 = time.time()
+            self.estimators_.append((name, clone(est).fit(X, y)))
+            print(f"  fitted {name} in {(time.time() - t0) / 60:.1f} min", flush=True)
+        self.classes_ = self.estimators_[0][1].classes_
+        w = np.ones(len(self.estimators_)) if self.blend_weights is None else np.asarray(self.blend_weights, float)
+        self.weights_ = w / w.sum()
+        return self
+
+    def predict_proba(self, X):
+        """Blended class probabilities.
+
+        Parameters
+        ----------
+        X : pandas.DataFrame
+
+        Returns
+        -------
+        numpy.ndarray
+        """
+        return sum(w * est.predict_proba(X) for w, (_, est) in zip(self.weights_, self.estimators_))
 
     def predict(self, X):
         """Predict labels with the weighted argmax rule.
@@ -348,7 +505,8 @@ def tune_hyperparameters(X, y, config=None, n_iter=8, frac=0.25, cv=3, random_st
 # --------------------------------------------------------------------------
 # cross-validation & final fit
 # --------------------------------------------------------------------------
-def cross_validate_oof(X, y, params=None, config=None, n_splits=5, random_state=SEED, verbose=True):
+def cross_validate_oof(X, y, params=None, config=None, n_splits=5, random_state=SEED, verbose=True,
+                       model="lgbm"):
     """Out-of-fold probabilities of the full pipeline (stratified K-fold).
 
     Every fold refits the whole pipeline (encoders included) on the training
@@ -366,6 +524,9 @@ def cross_validate_oof(X, y, params=None, config=None, n_splits=5, random_state=
     random_state : int, default=SEED
     verbose : bool, default=True
         Print the score of every fold.
+    model : {"lgbm", "xgb"}, default="lgbm"
+        Classifier of the pipeline. The folds depend only on ``y`` and
+        ``random_state``, so different models get identical folds.
 
     Returns
     -------
@@ -380,12 +541,13 @@ def cross_validate_oof(X, y, params=None, config=None, n_splits=5, random_state=
     skf = StratifiedKFold(n_splits, shuffle=True, random_state=random_state)
     for f, (tr, va) in enumerate(skf.split(X, y)):
         t0 = time.time()
-        pipe = build_pipeline(params, config).fit(X.iloc[tr], y[tr])
+        pipe = build_pipeline(params, config, model=model).fit(X.iloc[tr], y[tr])
         oof[va] = pipe.predict_proba(X.iloc[va])
         fold_ids[va] = f
         if verbose:
             score = macro_f1(y_idx[va], oof[va].argmax(1), len(classes))
-            print(f"fold {f}: macro F1 (argmax) = {score:.4f}  [{time.time() - t0:.0f}s]", flush=True)
+            print(f"[{model}] fold {f}: macro F1 (argmax) = {score:.4f}  [{(time.time() - t0) / 60:.1f} min]",
+                  flush=True)
         del pipe
     return oof, fold_ids, classes
 
@@ -450,7 +612,8 @@ def evaluate_config(X, y, config, params=None, n_splits=3, random_state=SEED):
             "minutes": (time.time() - t0) / 60}
 
 
-def run_ablation(X, y, params=None, frac=0.3, n_splits=3, steps=ABLATION_STEPS, random_state=SEED):
+def run_ablation(X, y, params=ABLATION_LGBM_PARAMS, frac=0.3, n_splits=3, steps=ABLATION_STEPS,
+                 random_state=SEED):
     """Greedy forward ablation of the iteration-3 features on a region subsample.
 
     Starts from :data:`scripts.preprocess.BASELINE_CONFIG` (iteration 2) and
@@ -463,8 +626,9 @@ def run_ablation(X, y, params=None, frac=0.3, n_splits=3, steps=ABLATION_STEPS, 
     ----------
     X : pandas.DataFrame
     y : numpy.ndarray
-    params : dict, optional
-        LightGBM parameters.
+    params : dict, default=ABLATION_LGBM_PARAMS
+        LightGBM parameters (fast settings: only the *difference* between
+        feature sets matters here).
     frac : float, default=0.3
         Fraction of regions (old VDC) used.
     n_splits : int, default=3
@@ -499,6 +663,65 @@ def run_ablation(X, y, params=None, frac=0.3, n_splits=3, steps=ABLATION_STEPS, 
     results[["macro_f1_argmax", "macro_f1_heldout", "gain", "minutes"]] = \
         results[["macro_f1_argmax", "macro_f1_heldout", "gain", "minutes"]].round(4)
     return current, results
+
+
+def optimize_blend(oof_a, oof_b, y_idx, fold_ids, alphas=None):
+    """Choose the blend weight of two OOF probability matrices for macro F1.
+
+    For every ``alpha`` the blend ``alpha * oof_a + (1 - alpha) * oof_b`` is
+    scored with class weights optimised in-sample (fast, 2 passes); the best
+    ``alpha`` is then re-evaluated honestly with :func:`honest_weight_cv`.
+
+    Parameters
+    ----------
+    oof_a, oof_b : numpy.ndarray of shape (n_rows, n_classes)
+    y_idx : numpy.ndarray of int
+    fold_ids : numpy.ndarray of int
+    alphas : sequence of float, optional
+        Candidate weights of ``oof_a`` (default 0, 0.1, ..., 1).
+
+    Returns
+    -------
+    alpha : float
+    table : pandas.DataFrame
+        In-sample macro F1 per alpha.
+    heldout : dict
+        Held-out macro F1 of model A, model B and the chosen blend.
+    """
+    alphas = np.round(np.linspace(0, 1, 11), 2) if alphas is None else np.asarray(alphas)
+    scores = [optimize_class_weights(a * oof_a + (1 - a) * oof_b, y_idx, n_iter=2)[1] for a in alphas]
+    alpha = float(alphas[int(np.argmax(scores))])
+    heldout = {"a": float(np.mean(honest_weight_cv(oof_a, y_idx, fold_ids))),
+               "b": float(np.mean(honest_weight_cv(oof_b, y_idx, fold_ids))),
+               "blend": float(np.mean(honest_weight_cv(alpha * oof_a + (1 - alpha) * oof_b, y_idx, fold_ids)))}
+    return alpha, pd.DataFrame({"alpha_a": alphas, "macro_f1_oof": np.round(scores, 4)}), heldout
+
+
+def fit_blend_model(X, y, config=None, params=None, blend_weights=None, class_weights=None,
+                    models=MODEL_TYPES):
+    """Fit the final :class:`BlendClassifier` on all training rows.
+
+    Parameters
+    ----------
+    X : pandas.DataFrame
+    y : numpy.ndarray
+    config : dict, optional
+        Feature configuration.
+    params : dict, optional
+        ``{"lgbm": {...}, "xgb": {...}}`` parameter overrides.
+    blend_weights : array-like, optional
+        Weight per model (same order as ``models``).
+    class_weights : array-like, optional
+        Per-class decision weights.
+    models : tuple of str, default=MODEL_TYPES
+
+    Returns
+    -------
+    BlendClassifier
+    """
+    params = params or {}
+    estimators = [(m, build_pipeline(params.get(m), config, model=m)) for m in models]
+    return BlendClassifier(estimators, blend_weights, class_weights).fit(X, y)
 
 
 def fit_final_model(X, y, params=None, class_weights=None, config=None):
@@ -548,8 +771,8 @@ def plot_feature_importance(model, path=None, top=25):
 
     Parameters
     ----------
-    model : WeightedArgmaxClassifier
-        Fitted model.
+    model : BlendClassifier or WeightedArgmaxClassifier
+        Fitted model (for a blend, its LightGBM pipeline is used).
     path : str or Path, optional
         Default: ``<output>/reports/figures/feature_importance.png``.
     top : int, default=25
@@ -559,7 +782,10 @@ def plot_feature_importance(model, path=None, top=25):
     pandas.Series
         Gain importance of every feature, sorted descending.
     """
-    pipe = model.estimator_
+    if hasattr(model, "estimators_"):
+        pipe = dict(model.estimators_).get("lgbm", model.estimators_[0][1])
+    else:
+        pipe = model.estimator_
     names = pipe.named_steps["prep"].get_feature_names_out()
     gain = pipe.named_steps["clf"].booster_.feature_importance(importance_type="gain")
     imp = pd.Series(gain, index=names).sort_values(ascending=False)
@@ -602,7 +828,7 @@ def plot_confusion(y, pred, path=None):
 # CLI
 # --------------------------------------------------------------------------
 def save_oof(oof, fold_ids, y, path=None):
-    """Save out-of-fold probabilities for error analysis (``reports/oof_predictions.npz``).
+    """Save out-of-fold probabilities for error analysis (``reports/oof_<model>.npz``).
 
     Parameters
     ----------
@@ -620,20 +846,56 @@ def save_oof(oof, fold_ids, y, path=None):
     return path
 
 
-def run_training(tune=False, n_iter=8, tune_frac=0.25, skip_cv=False, n_splits=5,
-                 ablation=False, ablation_frac=0.3, config=None):
-    """End-to-end training: optional ablation and tuning, CV, class weights, final fit, artefacts.
+def smoke_test(X, y, test, frac=0.03, random_state=SEED):
+    """Run every code path end-to-end on a tiny region subsample (a few minutes).
+
+    Covers all optional feature steps (clustering, residual, household,
+    adjacent, extra combos), the ablation evaluation, LightGBM and XGBoost
+    CV, blend optimisation, the final blend fit and test prediction. Raises
+    on the first error, so problems show up before the long run starts.
 
     Parameters
     ----------
-    tune : bool, default=False
-        Run :func:`tune_hyperparameters` first.
-    n_iter : int, default=8
-        Candidates of the random search.
-    tune_frac : float, default=0.25
-        Fraction of regions used for tuning.
+    X : pandas.DataFrame
+    y : numpy.ndarray
+    test : pandas.DataFrame
+    frac : float, default=0.03
+        Fraction of regions used.
+    random_state : int, default=SEED
+
+    Returns
+    -------
+    dict
+        Tiny-sample scores (only meaningful as "it runs").
+    """
+    t0 = time.time()
+    X_s, y_s = region_subsample(X, y, frac=frac, random_state=random_state)
+    full = {k: True for k in resolve_config(None)}
+    full["neighbor"] = "v2"
+    tiny = {"lgbm": dict(n_estimators=20), "xgb": dict(n_estimators=20)}
+    print(f"smoke test on {len(X_s):,} rows")
+    base = evaluate_config(X_s, y_s, BASELINE_CONFIG, tiny["lgbm"], n_splits=2)
+    oofs = {}
+    for m in MODEL_TYPES:
+        oofs[m], fold_ids, classes = cross_validate_oof(X_s, y_s, tiny[m], full, n_splits=2, model=m)
+    y_idx = np.searchsorted(classes, y_s)
+    alpha, _, heldout = optimize_blend(oofs["lgbm"], oofs["xgb"], y_idx, fold_ids)
+    model = fit_blend_model(X_s, y_s, full, tiny, [alpha, 1 - alpha])
+    pred = model.predict(test.head(2000))
+    assert set(np.unique(pred)) <= set(classes.tolist())
+    plot_feature_importance(model)
+    print(f"smoke test OK in {(time.time() - t0) / 60:.1f} min")
+    return {"baseline": round(base["macro_f1_heldout"], 4), **{k: round(v, 4) for k, v in heldout.items()}}
+
+
+def run_training(skip_cv=False, n_splits=5, ablation=False, ablation_frac=0.3, config=None,
+                 models=MODEL_TYPES, tune=False, n_iter=8, tune_frac=0.25):
+    """End-to-end training: ablation, (tuning), CV of every model, blend, final fit, artefacts.
+
+    Parameters
+    ----------
     skip_cv : bool, default=False
-        Skip cross-validation (class weights are then all ones).
+        Skip cross-validation (equal blend weights, class weights = 1).
     n_splits : int, default=5
         Folds of the cross-validation.
     ablation : bool, default=False
@@ -642,10 +904,16 @@ def run_training(tune=False, n_iter=8, tune_frac=0.25, skip_cv=False, n_splits=5
         Fraction of regions used for the ablation.
     config : dict, optional
         Feature configuration used when ``ablation`` is False.
+    models : tuple of str, default=("lgbm", "xgb")
+        Models to cross-validate and blend.
+    tune : bool, default=False
+        Tune LightGBM with :func:`tune_hyperparameters`.
+    n_iter : int, default=8
+    tune_frac : float, default=0.25
 
     Returns
     -------
-    model : WeightedArgmaxClassifier
+    model : BlendClassifier
     summary : dict
     """
     out = output_dir()
@@ -658,54 +926,76 @@ def run_training(tune=False, n_iter=8, tune_frac=0.25, skip_cv=False, n_splits=5
         abl.to_csv(out / "reports" / "ablation_results.csv", index=False)
         print(abl.to_string(index=False))
     print("feature config:", cfg)
-    summary = {"config": cfg, "params": dict(DEFAULT_LGBM_PARAMS)}
-
-    params = {}
-    if tune:
-        params, results = tune_hyperparameters(X, y, config=cfg, n_iter=n_iter, frac=tune_frac)
+    params = {m: {} for m in models}
+    if tune and "lgbm" in models:
+        params["lgbm"], results = tune_hyperparameters(X, y, config=cfg, n_iter=n_iter, frac=tune_frac)
         results.to_csv(out / "reports" / "tuning_results.csv", index=False)
-    summary["params"].update(params)
+    summary = {"config": cfg, "models": list(models),
+               "params": {"lgbm": {**DEFAULT_LGBM_PARAMS, **params.get("lgbm", {})},
+                          "xgb": {**DEFAULT_XGB_PARAMS, **params.get("xgb", {})}}}
 
-    weights = None
+    blend_weights, class_weights = None, None
     if not skip_cv:
-        oof, fold_ids, classes = cross_validate_oof(X, y, params, cfg, n_splits=n_splits)
-        save_oof(oof, fold_ids, y)
-        cv = summarize_cv(oof, y, fold_ids, classes)
-        weights = cv["class_weights"]
-        plot_confusion(y, classes[(oof * np.asarray(weights)).argmax(1)])
+        oofs = {}
+        for m in models:
+            oofs[m], fold_ids, classes = cross_validate_oof(X, y, params[m], cfg, n_splits=n_splits, model=m)
+            save_oof(oofs[m], fold_ids, y, out / "reports" / f"oof_{m}.npz")
+        y_idx = np.searchsorted(classes, y)
+        if len(models) == 2:
+            alpha, table, heldout = optimize_blend(oofs[models[0]], oofs[models[1]], y_idx, fold_ids)
+            blend_weights = [alpha, 1 - alpha]
+            table.to_csv(out / "reports" / "blend_search.csv", index=False)
+            summary["heldout_by_model"] = {models[0]: round(heldout["a"], 4), models[1]: round(heldout["b"], 4),
+                                           "blend": round(heldout["blend"], 4)}
+            blended = alpha * oofs[models[0]] + (1 - alpha) * oofs[models[1]]
+        else:
+            blend_weights = [1.0]
+            blended = oofs[models[0]]
+        cv = summarize_cv(blended, y, fold_ids, classes)
+        class_weights = cv["class_weights"]
+        plot_confusion(y, classes[(blended * np.asarray(class_weights)).argmax(1)])
         summary.update({k: v for k, v in cv.items() if k != "report"})
+        summary["blend_weights"] = dict(zip(models, np.round(blend_weights, 2).tolist()))
         summary["per_class_f1"] = {k: round(v["f1-score"], 4) for k, v in cv["report"].items()
                                    if k not in ("accuracy", "macro avg", "weighted avg")}
-        print(json.dumps({k: summary[k] for k in ("macro_f1_argmax", "macro_f1_heldout_mean",
-                                                  "class_weights")}, indent=1))
+        print(json.dumps({k: summary[k] for k in summary if k not in ("params", "config")}, indent=1, default=str))
 
     t0 = time.time()
-    model = fit_final_model(X, y, params, weights, cfg)
-    print(f"final model fitted in {time.time() - t0:.0f}s -> {save_model(model)}")
-    plot_feature_importance(model)
+    model = fit_blend_model(X, y, cfg, params, blend_weights, class_weights, models)
+    print(f"final model fitted in {(time.time() - t0) / 60:.1f} min -> {save_model(model)}")
+    imp = plot_feature_importance(model)
+    summary["top_features"] = imp.head(20).round(0).to_dict()
     with open(out / "reports" / "cv_summary.json", "w") as fh:
         json.dump(summary, fh, indent=2, default=str)
     return model, summary
 
 
 def main(argv=None):
-    """Parse command-line arguments and run :func:`run_training`.
+    """Parse command-line arguments and run :func:`run_training` (or :func:`smoke_test`).
 
     Parameters
     ----------
     argv : list of str, optional
     """
     parser = argparse.ArgumentParser(description="Train the structural damage model.")
+    parser.add_argument("--smoke", action="store_true", help="quick end-to-end check only")
     parser.add_argument("--ablation", action="store_true", help="choose the feature config by ablation")
     parser.add_argument("--ablation-frac", type=float, default=0.3, help="fraction of regions for ablation")
-    parser.add_argument("--tune", action="store_true", help="run RandomizedSearchCV")
+    parser.add_argument("--models", default="lgbm,xgb", help="comma separated: lgbm,xgb")
+    parser.add_argument("--tune", action="store_true", help="RandomizedSearchCV for LightGBM")
     parser.add_argument("--n-iter", type=int, default=8, help="random search candidates")
     parser.add_argument("--tune-frac", type=float, default=0.25, help="fraction of regions for tuning")
     parser.add_argument("--skip-cv", action="store_true", help="skip cross-validation")
     parser.add_argument("--n-splits", type=int, default=5, help="CV folds")
     args = parser.parse_args(argv)
-    run_training(tune=args.tune, n_iter=args.n_iter, tune_frac=args.tune_frac, skip_cv=args.skip_cv,
-                 n_splits=args.n_splits, ablation=args.ablation, ablation_frac=args.ablation_frac)
+    if args.smoke:
+        train, test, _ = load_data()
+        X, y = split_xy(train)
+        print(smoke_test(X, y, test))
+        return
+    run_training(skip_cv=args.skip_cv, n_splits=args.n_splits, ablation=args.ablation,
+                 ablation_frac=args.ablation_frac, models=tuple(args.models.split(",")),
+                 tune=args.tune, n_iter=args.n_iter, tune_frac=args.tune_frac)
 
 
 if __name__ == "__main__":
