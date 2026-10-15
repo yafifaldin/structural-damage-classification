@@ -4,6 +4,7 @@
 [Structural Damage Classification](https://www.kaggle.com/competitions/structural-damage-classification).
 
 Nama : Yafi Muhammad Faldin
+
 NRP : 5052241026
 
 ---
