@@ -1,0 +1,70 @@
+{
+  "config": {
+    "neighbor": "v2",
+    "household": true,
+    "adjacent": false,
+    "extra_combos": true,
+    "residual": true,
+    "kmeans": false,
+    "vuln": false
+  },
+  "models": [
+    "lgbm",
+    "xgb"
+  ],
+  "blend_weights": {
+    "lgbm": 0.6,
+    "xgb": 0.4
+  },
+  "heldout_by_model": {
+    "a": 0.5993,
+    "b": 0.5991,
+    "blend": 0.6003
+  },
+  "class_weights": [
+    1.2214,
+    1.6487,
+    1.4918,
+    1.284,
+    1.0
+  ],
+  "macro_f1_argmax": 0.5953,
+  "macro_f1_weighted_oof": 0.6005,
+  "macro_f1_heldout_per_fold": [
+    0.6,
+    0.598,
+    0.6017,
+    0.6016,
+    0.6004
+  ],
+  "macro_f1_heldout_mean": 0.6003,
+  "per_class_f1": {
+    "1": 0.6982,
+    "2": 0.474,
+    "3": 0.4933,
+    "4": 0.573,
+    "5": 0.7639
+  },
+  "top_features": {
+    "ri_expected": 887383.0,
+    "te_id10_p5": 480566.0,
+    "nb30_p4": 292254.0,
+    "te_c_id9_superstructure_p5": 274793.0,
+    "te_c_id9_superstructure_p1": 273042.0,
+    "nb30_p3": 247975.0,
+    "nb10_p5": 243684.0,
+    "te_c_id6_superstructure_p1": 208743.0,
+    "te_id10_p4": 181848.0,
+    "te_id10_p2": 159896.0,
+    "te_c_id6_ground_floor_type_p1": 157398.0,
+    "te_c_id6_superstructure_p5": 153822.0,
+    "nb30_p2": 135155.0,
+    "te_c_id6_ground_floor_type_p5": 118351.0,
+    "te_id9_p4": 115492.0,
+    "te_id10_p3": 98478.0,
+    "te_id8_p4": 93031.0,
+    "te_id8_p3": 90044.0,
+    "te_id9_p3": 89772.0,
+    "ri_cons": 86367.0
+  }
+}

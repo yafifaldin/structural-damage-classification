@@ -1,0 +1,9 @@
+step,macro_f1_argmax,macro_f1_heldout,minutes,gain,kept
+"baseline (iterasi 2)",0.5870,0.5906,2.3096,0.0000,True
+"neighbor_v2 (jarak per rumah tangga)",0.5870,0.5916,2.4299,0.0010,True
+"household (bangunan serumah)",0.5880,0.5918,2.3794,0.0003,True
+"adjacent_area (ward/blok tetangga)",0.5884,0.5917,2.3953,-0.0001,False
+"extra_combos (lantai atas, umur, id9 x material)",0.5880,0.5923,2.5945,0.0004,True
+"residual_intensity (intensitas bersih dua tahap)",0.5887,0.5926,3.2859,0.0004,True
+"kmeans_btype (clustering KMeans)",0.5879,0.5913,3.4046,-0.0013,False
+"vuln_vtype (tipe kerentanan supervised)",0.5877,0.5909,3.7920,-0.0017,False
