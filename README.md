@@ -1,9 +1,10 @@
 # Klasifikasi Tingkat Kerusakan Bangunan Pasca Gempa Gorkha 2015
 
-Tugas 1 Supervised Machine Learning: kompetisi Kaggle
+
 [Structural Damage Classification](https://www.kaggle.com/competitions/structural-damage-classification).
 
-Disusun oleh: **[Nama]** ([NIM])
+Nama : Yafi Muhammad Faldin
+NRP : 5052241026
 
 ---
 
